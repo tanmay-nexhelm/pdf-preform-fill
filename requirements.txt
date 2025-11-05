@@ -1,0 +1,7 @@
+pytesseract 
+pillow 
+PyPDF2 
+reportlab 
+openai
+pdf2image
+python-dotenv
