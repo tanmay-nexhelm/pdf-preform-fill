@@ -1,70 +1,62 @@
-from PyPDF2 import PdfReader, PdfWriter
-from PyPDF2.generic import NameObject, TextStringObject
+import fitz  # PyMuPDF
 
-def fill_acroform(pdf_path, data, output_path):
+def fill_acroform(pdf_path, filled_data, output_path):
     """
-    Fill AcroForm fields safely (handles nested + unlinked widgets).
-    Converts string values to proper PDF TextStringObject.
+    Fill an AcroForm PDF with provided field-value pairs using PyMuPDF.
+
+    Args:
+        pdf_path: Path to input PDF
+        filled_data: Dict mapping field names to values
+        output_path: Path for output filled PDF
     """
-    reader = PdfReader(pdf_path)
-    writer = PdfWriter()
+    if not filled_data:
+        print("WARNING: No data to fill")
+        return
 
-    # Copy pages into writer
-    for page in reader.pages:
-        writer.add_page(page)
+    doc = fitz.open(pdf_path)
+    filled_count = 0
 
-    # Fill top-level AcroForm fields (if they exist)
-    writer.update_page_form_field_values(writer.pages[0], data)
+    # Fill each form field
+    for page in doc:
+        for field in page.widgets():
+            full_field_name = field.field_name
+            # Extract short name (last part after last dot)
+            # e.g., 'clients[0].Form[0].SchwabAccountNumbe[0]' -> 'SchwabAccountNumbe[0]'
+            short_field_name = full_field_name.split('.')[-1] if '.' in full_field_name else full_field_name
 
-    # Fallback: fill widget annotations manually
-    for page in writer.pages:
-        if "/Annots" in page:
-            for field_ref in page["/Annots"]:
-                widget = field_ref.get_object()
-                field_name = widget.get("/T")
-                if field_name and field_name in data:
-                    value = data[field_name]
-                    # Convert to proper PDF string object
-                    widget.update({
-                        NameObject("/V"): TextStringObject(str(value))
-                    })
+            # Check both full and short names
+            if full_field_name in filled_data:
+                value = str(filled_data[full_field_name])
+            elif short_field_name in filled_data:
+                value = str(filled_data[short_field_name])
+            else:
+                continue
 
-    # Ensure the AcroForm dictionary exists
-    if "/AcroForm" in writer._root_object:
-        writer._root_object["/AcroForm"].update({
-            NameObject("/NeedAppearances"): NameObject("/true")
-        })
+            try:
+                field.field_value = value
+                field.update()
+                filled_count += 1
+            except Exception as e:
+                print(f"WARNING: Failed to fill {short_field_name}: {e}")
 
-    # Write output safely
-    with open(output_path, "wb") as f:
-        writer.write(f)
+    print(f"Filled {filled_count} fields")
 
-    print(f"✅ AcroForm filled successfully → {output_path}")
+    # Save the filled PDF (not flattened yet - keeps form editable)
+    temp_path = output_path.replace(".pdf", "_temp.pdf")
+    doc.save(temp_path, garbage=4, deflate=True)
+    doc.close()
+
+    # Flatten to make fields non-editable
+    flatten_pdf(temp_path, output_path)
+    print(f"Saved filled PDF: {output_path}")
 
 
-def fill_static_pdf(pdf_path, detected_fields, data, output_path):
-    """Overlay text on coordinates for static PDFs."""
-    packet = io.BytesIO()
-    can = canvas.Canvas(packet, pagesize=letter)
-
-    for f in detected_fields:
-        label = f["label"]
-        coords = f["coords"]
-        if label in data:
-            can.drawString(coords[0], coords[1], data[label])
-
-    can.save()
-    packet.seek(0)
-
-    overlay = PdfReader(packet)
-    base = PdfReader(pdf_path)
-    writer = PdfWriter()
-
-    for page in base.pages:
-        overlay_page = overlay.pages[0]
-        page.merge_page(overlay_page)
-        writer.add_page(page)
-
-    with open(output_path, "wb") as f:
-        writer.write(f)
-    print(f"✅ Static PDF filled successfully → {output_path}")
+def flatten_pdf(input_pdf, output_pdf):
+    """
+    Flatten form fields so filled data is visible as static text.
+    """
+    doc = fitz.open(input_pdf)
+    for page in doc:
+        page.clean_contents()  # ensure proper rendering
+    doc.save(output_pdf, deflate=True, garbage=4)
+    doc.close()

@@ -1,24 +1,50 @@
 import os
-from utils.pdf_utils import extract_acroform_fields
-from utils.llm_utils import map_fields_to_cdm
-from utils.data_utils import fetch_from_cdm
 from utils.fill_utils import fill_acroform
+from utils.field_mapper import create_fill_mapping_direct
 from PyPDF2 import PdfReader
 
 # ----------------------------
 #  Canonical Data Model (CDM)
 # ----------------------------
 CDM = {
+    # Personal Information
     "person.first_name": "Jane",
+    "person.middle_name": "Marie",
     "person.last_name": "Doe",
+    "person.suffix": "Jr.",
     "person.ssn": "123-45-6789",
+    "person.phone": "767-788-3272",
+    "person.phone_extension": "123",
     "person.address": "123 Main Street, New York, NY",
     "person.city": "New York",
     "person.state": "NY",
     "person.zip": "10001",
+
+    # Account Information
     "account.number": "SCHW12345",
     "account.type": "Individual",
-    "bank.name": "Chase Bank"
+    "bank.name": "Chase Bank",
+
+    # Employer/Plan Information
+    "plan.employer_name": "ABC Corporation",
+    "plan.type": "401(k)",
+    "plan.name": "ABC Corp 401(k) Plan",
+
+    # Distribution Information
+    "distribution.type": "One-Time",
+    "distribution.onetime_cash_amount": "50000.00",
+    "distribution.onetime_securities": "No",
+    "distribution.recurring_cash_amount": "",
+    "distribution.recurring_start_date": "",
+    "distribution.recurring_frequency": "",
+    "distribution.recurring_income_option": "",
+    "distribution.recurring_income_start_date": "",
+    "distribution.lump_sum": "Yes",
+
+    # Tax Withholding
+    "tax.federal_withholding_rate": "20",
+    "tax.state_withholding": "NY",
+    "tax.state_withholding_rate": "5"
 }
 
 
@@ -35,46 +61,41 @@ def detect_form_type(pdf_path):
 
 
 def process_form(pdf_path, output_path):
-    """Main form processing pipeline."""
-    print(f"📄 Processing form: {pdf_path}")
+    """
+    Process PDF form by mapping fields to CDM and filling with data.
 
-    form_type = detect_form_type(pdf_path)
-    print(f"🔍 Detected form type: {form_type}")
+    Args:
+        pdf_path: Path to input PDF form
+        output_path: Path for output filled PDF
+    """
+    print(f"Processing form: {pdf_path}")
 
-    if form_type == "acroform":
-        # 1. Extract fields
-        fields = extract_acroform_fields(pdf_path)
+    # Get actual PDF field names
+    reader = PdfReader(pdf_path)
+    pdf_fields = reader.get_fields()
+    if not pdf_fields:
+        print("ERROR: No form fields found in PDF")
+        return
 
-        # 2. Identify empty fields
-        empty_fields = [
-            k for k, v in fields.items()
-            if not v["value"] or str(v["value"]).strip() == ""
-        ]
-        print(f"🧾 Empty fields found: {empty_fields}")
+    actual_field_names = list(pdf_fields.keys())
+    print(f"Found {len(actual_field_names)} total fields in PDF")
 
-        # 3. Normalize for LLM mapping
-        normalized_fields = [fields[k]["clean_name"] for k in empty_fields]
+    # Map fields directly to CDM keys and fetch values
+    print("\n" + "="*80)
+    print("Mapping PDF fields to CDM keys...")
+    print("="*80)
+    filled_data = create_fill_mapping_direct(actual_field_names, CDM)
 
-        # 4. Run LLM mapping (batched + safe)
-        llm_mapping = map_fields_to_cdm(normalized_fields, CDM)
+    if not filled_data:
+        print("WARNING: No fields were mapped successfully")
+        return
 
-        # 5. Re-associate normalized → real field names
-        final_mapping = {}
-        for raw, clean in zip(empty_fields, normalized_fields):
-            if clean in llm_mapping and llm_mapping[clean]:
-                final_mapping[raw] = llm_mapping[clean]
+    print(f"\nSuccessfully mapped {len(filled_data)} fields")
 
-        # 6. Fetch values from CDM
-        filled_data = fetch_from_cdm(final_mapping, CDM)
+    # Fill form with mapped data
+    fill_acroform(pdf_path, filled_data, output_path)
 
-        # 7. Fill the AcroForm
-        fill_acroform(pdf_path, filled_data, output_path)
-
-        print(f"✅ Prefill complete → {output_path}")
-
-    else:
-        print("⚠️ Static form processing not implemented yet.")
-
+    print(f"Complete: {output_path}")
 
 # ----------------------------
 #  Entry Point
