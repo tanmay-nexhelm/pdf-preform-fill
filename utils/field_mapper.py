@@ -6,12 +6,13 @@ import os
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-def map_fields_to_cdm_direct(actual_field_names, cdm, chunk_size=40):
+def map_fields_to_cdm_direct(actual_field_names, field_labels, cdm, chunk_size=40):
     """
-    Directly map PDF field names to CDM keys using LLM.
+    Map PDF fields to CDM keys using visual labels and semantic understanding.
 
     Args:
         actual_field_names: List of actual PDF field names
+        field_labels: Dict mapping field names to their visual labels
         cdm: The Canonical Data Model dict
 
     Returns:
@@ -44,41 +45,50 @@ def map_fields_to_cdm_direct(actual_field_names, cdm, chunk_size=40):
     for i in range(0, len(filtered_fields), chunk_size):
         chunk = filtered_fields[i:i+chunk_size]
 
-        prompt = f"""You are a PDF form field mapper for financial documents.
+        # Create field info with labels
+        field_info = {}
+        for field_name in chunk:
+            # Extract short field name for display
+            short_name = field_name.split('.')[-1] if '.' in field_name else field_name
+            label = field_labels.get(field_name, short_name)
+            field_info[field_name] = {
+                "label": label,
+                "technical_name": short_name
+            }
 
-Given these technical PDF field names and available CDM (Canonical Data Model) keys, map each field to the most appropriate CDM key.
+        prompt = f"""You are a PDF form field mapper. Map form fields to CDM keys using semantic understanding of field labels.
 
-PDF Field Names:
-{json.dumps(chunk, indent=2)}
+Form Fields with Visual Labels:
+{json.dumps(field_info, indent=2)}
 
 Available CDM Keys:
 {json.dumps(cdm_keys, indent=2)}
 
-Return a JSON mapping from PDF field name to CDM key. If no appropriate CDM key exists, use null.
+Instructions:
+- Use the "label" field to understand what data the field expects
+- Match labels to CDM keys based on semantic meaning
+- If no appropriate CDM key exists, use null
 
-Field Name Patterns:
-- "Last[0]" or "LastName" → person.last_name
-- "Middle[0]" → person.middle_name (if not available, use null)
-- "AccountHoldersNam[0]" → person.first_name
-- "First[0]" or "FirstName" → person.first_name
-- "City[0]" or "CityField" → person.city
-- "State[0]" or "StateField" → person.state
-- "ZipCode[0]" or "Zip" → person.zip
-- "DaytimePhoneNumber[0]" → person.phone
-- "Extension[0]" → person.phone_extension
-- "HomeLegalStreetAd[0]" or "StreetAddress" → person.address
-- "SchwabAccountNumbe[0]" or "AccountNumber" → account.number
-- "SSN[0]" or "SocialSecurityNumb[0]" → person.ssn
-- "EmployerPlanNameo[0]" → plan.employer_name
-- "BankName[0]" → bank.name
-- "RoutingNumber[0]" → bank.routing (if not available, use null)
-- "AccountType[0]" → account.type
+Semantic Guidelines:
+- Labels about last names, surnames, family names → person.last_name
+- Labels about first names, given names → person.first_name
+- Labels about middle names, middle initial → person.middle_name
+- Labels about cities, towns, municipalities → person.city
+- Labels about states, provinces → person.state
+- Labels about ZIP codes, postal codes → person.zip
+- Labels about phone numbers, telephone → person.phone
+- Labels about addresses, street addresses → person.address
+- Labels about SSN, social security → person.ssn
+- Labels about account numbers, account IDs → account.number
+- Labels about bank names, financial institution → bank.name
+- Labels about account types → account.type
+- Labels about employer names, company names → plan.employer_name
+- Labels about plan types, 401k, retirement plan → plan.type
 
-Return ONLY valid JSON:
+Return ONLY valid JSON mapping field names to CDM keys:
 {{
   "Last[0]": "person.last_name",
   "City[0]": "person.city",
-  "AccountHoldersNam[0]": "person.first_name",
   ...
 }}
 """
@@ -105,18 +115,19 @@ Return ONLY valid JSON:
     return mapping
 
 
-def create_fill_mapping_direct(actual_field_names, cdm):
+def create_fill_mapping_direct(actual_field_names, field_labels, cdm):
     """
-    Create fill mapping by directly mapping PDF fields to CDM keys.
+    Create fill mapping by mapping PDF fields to CDM keys using visual labels.
 
     Args:
         actual_field_names: List of actual PDF field names
+        field_labels: Dict mapping field names to their visual labels
         cdm: The Canonical Data Model dict
 
     Returns:
         Dict mapping actual field names to values to fill
     """
-    field_to_cdm = map_fields_to_cdm_direct(actual_field_names, cdm)
+    field_to_cdm = map_fields_to_cdm_direct(actual_field_names, field_labels, cdm)
 
     print("\nCreating field-to-value mapping...")
     fill_mapping = {}

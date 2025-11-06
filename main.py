@@ -1,6 +1,7 @@
 import os
 from utils.fill_utils import fill_acroform
 from utils.field_mapper import create_fill_mapping_direct
+from utils.label_extractor import extract_field_labels
 from PyPDF2 import PdfReader
 
 # ----------------------------
@@ -54,7 +55,7 @@ CDM = {
 
 def detect_form_type(pdf_path):
     """Detect whether the PDF is an AcroForm or static."""
-    reader = PdfReader(pdf_path)
+    reader = PdfReader(pdf_path)  # using PyPDF2 to read the PDF file
     if "/AcroForm" in reader.trailer["/Root"]:
         return "acroform"
     return "static"
@@ -80,11 +81,16 @@ def process_form(pdf_path, output_path):
     actual_field_names = list(pdf_fields.keys())
     print(f"Found {len(actual_field_names)} total fields in PDF")
 
-    # Map fields directly to CDM keys and fetch values
+    # Extract visual labels for form fields
+    print("Extracting visual labels from PDF...")
+    field_labels = extract_field_labels(pdf_path)
+    print(f"Extracted labels for {len(field_labels)} fields")
+
+    # Map fields to CDM keys using visual labels
     print("\n" + "="*80)
-    print("Mapping PDF fields to CDM keys...")
+    print("Mapping PDF fields to CDM keys using visual labels...")
     print("="*80)
-    filled_data = create_fill_mapping_direct(actual_field_names, CDM)
+    filled_data = create_fill_mapping_direct(actual_field_names, field_labels, CDM)
 
     if not filled_data:
         print("WARNING: No fields were mapped successfully")
@@ -104,7 +110,7 @@ if __name__ == "__main__":
     os.makedirs("filled_outputs", exist_ok=True)
 
     # Change to your test form
-    form_path = "./sample_forms/complex_acro.pdf"
-    output_path = "./filled_outputs/filled_output_acroform.pdf"
+    form_path = "./sample_forms/easy-acro.pdf"
+    output_path = "./filled_outputs/filled_output_easy_acroform.pdf"
 
     process_form(form_path, output_path)
