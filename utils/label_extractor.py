@@ -1,180 +1,288 @@
 import fitz  # PyMuPDF
-import re
+import json
+from openai import OpenAI
+from dotenv import load_dotenv
+import os
 
-def extract_field_labels(pdf_path, search_radius=100):
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Patterns to filter out irrelevant form fields
+IGNORE_PATTERNS = [
+    "FormMaster", "pageSet", "section", "subform", "border",
+    "table", "btn", "button", "QRCode", "signature", "SignLine",
+    "CLRPNT", "Header", "Footer", "Row", "Form", "Master",
+    "subSection", "RB", "ck", "image", "#subform", "#pageSet",
+    "BARCOD", "Checkbox", "DateSigned", "SignHere", "FullName"
+]
+
+
+def filter_noise_fields(fields):
     """
-    Extract visual text labels for form fields in a PDF.
+    Filter out irrelevant form fields based on widget ID patterns.
 
     Args:
-        pdf_path: Path to the PDF file
-        search_radius: Maximum distance (in pixels) to search for labels near fields
+        fields: List of field dicts with 'field_id', 'x', 'y'
 
     Returns:
-        Dict mapping field names to their visual labels
-        Example: {"Last[0]": "Last Name:", "City[0]": "City"}
+        Filtered list of fields
     """
-    doc = fitz.open(pdf_path)
-    field_labels = {}
+    filtered = []
+    for field in fields:
+        field_id = field.get("field_id", "")
 
-    for page_num, page in enumerate(doc):
-        # Extract all text blocks with their positions
-        text_blocks = page.get_text("dict")["blocks"]
+        # Skip if matches ignore patterns
+        if any(pattern in field_id for pattern in IGNORE_PATTERNS):
+            continue
 
-        # Get all form fields on this page
-        widgets = page.widgets()
+        # Skip very short field IDs
+        if len(field_id) < 3:
+            continue
 
-        for widget in widgets:
-            field_name = widget.field_name
-            field_rect = widget.rect  # (x0, y0, x1, y1)
+        filtered.append(field)
 
-            # Find text near this field
-            label = find_nearby_text(field_rect, text_blocks, search_radius)
-
-            if label:
-                # Clean and normalize the label
-                cleaned_label = clean_label_text(label)
-                if cleaned_label:
-                    field_labels[field_name] = cleaned_label
-
-    doc.close()
-    return field_labels
+    return filtered
 
 
-def find_nearby_text(field_rect, text_blocks, search_radius):
+def extract_page_fields(page):
     """
-    Find text blocks near a form field.
-
-    Searches in priority order:
-    1. Text directly above the field (most common for labels)
-    2. Text to the left of the field
-    3. Text below or right (less common)
+    Extract form field IDs with their X, Y positions from a page.
 
     Args:
-        field_rect: Rectangle of the form field (x0, y0, x1, y1)
-        text_blocks: List of text blocks from page.get_text("dict")
-        search_radius: Maximum distance to search
+        page: PyMuPDF page object
 
     Returns:
-        Text string found near the field, or None
+        List of dicts: [{"field_id": str, "x": float, "y": float}, ...]
     """
-    field_x0, field_y0, field_x1, field_y1 = field_rect
-    field_center_x = (field_x0 + field_x1) / 2
-    field_center_y = (field_y0 + field_y1) / 2
+    fields = []
+    widgets = page.widgets()
 
-    candidates = []
+    for widget in widgets:
+        field_name = widget.field_name
+        field_rect = widget.rect  # (x0, y0, x1, y1)
 
-    for block in text_blocks:
-        # Skip non-text blocks (images, etc.)
-        if block.get("type") != 0:
-            continue
+        # Use center point of field for position
+        x = (field_rect[0] + field_rect[2]) / 2
+        y = (field_rect[1] + field_rect[3]) / 2
 
-        # Extract text from block
-        block_text = ""
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                block_text += span.get("text", "") + " "
+        # Extract short name (last part after dots)
+        short_name = field_name.split('.')[-1] if '.' in field_name else field_name
 
-        block_text = block_text.strip()
-        if not block_text:
-            continue
-
-        # Get block position
-        block_rect = block["bbox"]  # (x0, y0, x1, y1)
-        block_x0, block_y0, block_x1, block_y1 = block_rect
-        block_center_x = (block_x0 + block_x1) / 2
-        block_center_y = (block_y0 + block_y1) / 2
-
-        # Calculate distance from block to field
-        distance_x = abs(block_center_x - field_center_x)
-        distance_y = abs(block_center_y - field_center_y)
-        distance = (distance_x ** 2 + distance_y ** 2) ** 0.5
-
-        # Only consider blocks within search radius
-        if distance > search_radius:
-            continue
-
-        # Determine position relative to field
-        is_above = block_y1 < field_y0
-        is_left = block_x1 < field_x0
-        is_below = block_y0 > field_y1
-        is_right = block_x0 > field_x1
-
-        # Assign priority (lower is better)
-        if is_above and abs(block_center_x - field_center_x) < 50:
-            # Text directly above (most common pattern)
-            priority = 1
-        elif is_left and abs(block_center_y - field_center_y) < 20:
-            # Text to the left, same vertical alignment
-            priority = 2
-        elif is_above:
-            # Text above but not aligned
-            priority = 3
-        elif is_left:
-            # Text to the left but not aligned
-            priority = 4
-        else:
-            # Text below or to the right (uncommon for labels)
-            priority = 5
-
-        candidates.append({
-            "text": block_text,
-            "distance": distance,
-            "priority": priority
+        fields.append({
+            "field_id": short_name,
+            "full_field_id": field_name,
+            "x": round(x, 1),
+            "y": round(y, 1)
         })
 
-    if not candidates:
-        return None
+    # Sort by Y position (top to bottom), then X position (left to right)
+    fields.sort(key=lambda f: (f["y"], f["x"]))
 
-    # Sort by priority first, then by distance
-    candidates.sort(key=lambda x: (x["priority"], x["distance"]))
-
-    # Return the best candidate
-    return candidates[0]["text"]
+    return fields
 
 
-def clean_label_text(text):
+def classify_and_map_fields_llm(page_text, fields, cdm_schema, form_type, page_num, chunk_size=25):
     """
-    Clean and normalize label text.
-
-    Removes common artifacts like:
-    - Trailing colons
-    - Extra whitespace
-    - Special characters that aren't part of the label
-    - Asterisks (required field markers)
+    Process fields in chunks using GPT-4o-mini for fast classification and mapping.
 
     Args:
-        text: Raw text string
+        page_text: Full text content of the page
+        fields: List of field dicts with field_id, x, y positions
+        cdm_schema: Dict of CDM keys and their values
+        form_type: Description of form type provided by user
+        page_num: Page number (for context)
+        chunk_size: Number of fields to process per LLM call (default: 25)
 
     Returns:
-        Cleaned text string
+        Dict mapping field IDs to CDM keys: {"field_id": "cdm_key" or None}
     """
-    if not text:
-        return ""
+    if not fields:
+        return {}
 
-    # Remove extra whitespace
-    text = " ".join(text.split())
+    # Process fields in chunks for faster response
+    all_mappings = {}
+    total_chunks = (len(fields) + chunk_size - 1) // chunk_size
 
-    # Remove trailing colons and asterisks
-    text = text.rstrip(":*")
+    for chunk_idx in range(0, len(fields), chunk_size):
+        chunk_fields = fields[chunk_idx:chunk_idx + chunk_size]
+        chunk_num = chunk_idx // chunk_size + 1
 
-    # Remove leading/trailing whitespace again
-    text = text.strip()
+        print(f"  Processing chunk {chunk_num}/{total_chunks} ({len(chunk_fields)} fields)...")
 
-    # Remove text that looks like instructions rather than labels
-    # (e.g., "Please enter", "Click here", etc.)
-    if len(text) > 100:  # Labels are usually short
-        return ""
+        chunk_mappings = _process_field_chunk(
+            page_text, chunk_fields, cdm_schema, form_type, page_num
+        )
+        all_mappings.update(chunk_mappings)
 
-    instruction_patterns = [
-        r"^please\s",
-        r"^click\s",
-        r"^enter\s",
-        r"^select\s",
-        r"^check\s",
+    return all_mappings
+
+
+def _process_field_chunk(page_text, fields, cdm_schema, form_type, page_num):
+    """
+    Process a chunk of fields with simplified chain-of-thought reasoning.
+
+    Args:
+        page_text: Full text content of the page
+        fields: List of field dicts with field_id, x, y positions (chunk)
+        cdm_schema: Dict of CDM keys and their values
+        form_type: Description of form type provided by user
+        page_num: Page number (for context)
+
+    Returns:
+        Dict mapping field IDs to CDM keys: {"field_id": "cdm_key" or None}
+    """
+    if not fields:
+        return {}
+
+    # Organize CDM keys by category
+    cdm_categories = {
+        "Personal Info": [k for k in cdm_schema.keys() if k.startswith("person.")],
+        "Account Info": [k for k in cdm_schema.keys() if k.startswith("account.")],
+        "Bank Info": [k for k in cdm_schema.keys() if k.startswith("bank.")],
+        "Plan Info": [k for k in cdm_schema.keys() if k.startswith("plan.")],
+        "Distribution Info": [k for k in cdm_schema.keys() if k.startswith("distribution.")],
+        "Tax Info": [k for k in cdm_schema.keys() if k.startswith("tax.")]
+    }
+
+    cdm_text = "\n".join([
+        f"{cat}: {', '.join(keys)}"
+        for cat, keys in cdm_categories.items() if keys
+    ])
+
+    # Prepare fields for prompt (only include field_id, x, y)
+    fields_for_prompt = [
+        {"field_id": f["field_id"], "x": f["x"], "y": f["y"]}
+        for f in fields
     ]
 
-    for pattern in instruction_patterns:
-        if re.match(pattern, text.lower()):
-            return ""
+    prompt = f"""FORM TYPE: {form_type}
 
-    return text
+PAGE {page_num} TEXT:
+{page_text[:3000]}...
+
+FIELDS TO CLASSIFY (Y-ordered):
+{json.dumps(fields_for_prompt, indent=2)}
+
+CDM KEYS: {cdm_text}
+
+TASK: For each field, determine:
+1. ENTITY: Is this PRIMARY account holder or SECONDARY (beneficiary/spouse/auth/trustee)?
+   - Check page text for section context
+   - Check field ID for hints ("benef", "spouse", "auth" = SECONDARY)
+   - Check Y-position: fields grouped together = same entity
+   - If uncertain → SECONDARY (safe)
+
+2. CDM MAPPING (PRIMARY only):
+   - FirstName/Given → person.first_name
+   - LastName/Surname → person.last_name
+   - SSN/TaxID → person.ssn
+   - Phone/Tel → person.phone
+   - Address/Street → person.address
+   - City → person.city, State → person.state, ZIP → person.zip
+   - AccountNum/AcctNum → account.number
+   - AccountType → account.type
+   - BankName → bank.name
+   - If SECONDARY or no match → null
+
+RULES:
+- Beneficiary/Spouse/Authorized sections → SECONDARY
+- Field ID with "benef"/"spouse"/"auth"/"trustee" → SECONDARY
+- When uncertain → SECONDARY
+
+OUTPUT (valid JSON only):
+{{
+  "FirstName[0]": {{"cdm_key": "person.first_name", "reasoning": "Primary holder section, Y:150, FirstName → person.first_name"}},
+  "benef_FirstName[0]": {{"cdm_key": null, "reasoning": "Beneficiary section, has 'benef' prefix → SECONDARY"}},
+  "AcctNum[0]": {{"cdm_key": "account.number", "reasoning": "Primary section, AccountNum → account.number"}}
+}}
+
+Return JSON for ALL {len(fields_for_prompt)} fields.
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a precise financial form analyzer. Return only valid JSON. Classify fields as PRIMARY or SECONDARY and map PRIMARY fields to CDM keys."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            response_format={"type": "json_object"}
+        )
+
+        result = json.loads(response.choices[0].message.content)
+
+        # Extract just the cdm_key mappings (remove reasoning from result)
+        mappings = {}
+        for field_id, data in result.items():
+            if isinstance(data, dict):
+                mappings[field_id] = data.get("cdm_key")
+            else:
+                mappings[field_id] = data
+
+        return mappings
+
+    except Exception as e:
+        print(f"WARNING: LLM classification failed for page {page_num}: {e}")
+        return {}
+
+
+def process_pdf_form(pdf_path, cdm_schema, form_type):
+    """
+    Process entire PDF form with simplified workflow.
+
+    Args:
+        pdf_path: Path to PDF file
+        cdm_schema: Dict of CDM keys and values
+        form_type: Description of form type
+
+    Returns:
+        Dict mapping field IDs to CDM keys: {"field_id": "cdm_key"}
+    """
+    doc = fitz.open(pdf_path)
+    all_mappings = {}
+
+    for page_num, page in enumerate(doc):
+        # Extract page text
+        page_text = page.get_text("text")
+
+        # Extract fields with positions
+        fields = extract_page_fields(page)
+
+        # Filter out noise fields
+        filtered_fields = filter_noise_fields(fields)
+
+        if not filtered_fields:
+            print(f"Page {page_num + 1}: No fields to process")
+            continue
+
+        print(f"Page {page_num + 1}: Processing {len(filtered_fields)} fields (filtered from {len(fields)} total)")
+
+        # Single LLM call for classification + mapping
+        mappings = classify_and_map_fields_llm(
+            page_text,
+            filtered_fields,
+            cdm_schema,
+            form_type,
+            page_num + 1
+        )
+
+        # Store both short and full field names
+        for field in filtered_fields:
+            short_id = field["field_id"]
+            full_id = field["full_field_id"]
+
+            if short_id in mappings:
+                cdm_key = mappings[short_id]
+                if cdm_key:  # Only store if not null
+                    all_mappings[short_id] = cdm_key
+                    all_mappings[full_id] = cdm_key
+
+    doc.close()
+    return all_mappings

@@ -1,7 +1,6 @@
 import os
 from utils.fill_utils import fill_acroform
-from utils.field_mapper import create_fill_mapping_direct
-from utils.label_extractor import extract_field_labels
+from utils.label_extractor import process_pdf_form
 from PyPDF2 import PdfReader
 
 # ----------------------------
@@ -61,42 +60,55 @@ def detect_form_type(pdf_path):
     return "static"
 
 
-def process_form(pdf_path, output_path):
+def process_form_simple(pdf_path, output_path, form_type_description):
     """
-    Process PDF form by mapping fields to CDM and filling with data.
+    Process PDF form with simplified workflow - single LLM call per page.
 
     Args:
         pdf_path: Path to input PDF form
         output_path: Path for output filled PDF
+        form_type_description: Description of the form type and purpose
     """
     print(f"Processing form: {pdf_path}")
+    print(f"Form Type: {form_type_description}\n")
 
-    # Get actual PDF field names
+    # Get actual PDF field names to verify form has fields
     reader = PdfReader(pdf_path)
     pdf_fields = reader.get_fields()
     if not pdf_fields:
         print("ERROR: No form fields found in PDF")
         return
 
-    actual_field_names = list(pdf_fields.keys())
-    print(f"Found {len(actual_field_names)} total fields in PDF")
+    print(f"Found {len(pdf_fields)} total fields in PDF\n")
 
-    # Extract visual labels for form fields
-    print("Extracting visual labels from PDF...")
-    field_labels = extract_field_labels(pdf_path)
-    print(f"Extracted labels for {len(field_labels)} fields")
-
-    # Map fields to CDM keys using visual labels
-    print("\n" + "="*80)
-    print("Mapping PDF fields to CDM keys using visual labels...")
+    # Process PDF with simplified workflow: extract fields + classify + map in one go
     print("="*80)
-    filled_data = create_fill_mapping_direct(actual_field_names, field_labels, CDM)
+    print("PROCESSING PAGES WITH CHAIN-OF-THOUGHT REASONING")
+    print("="*80 + "\n")
 
-    if not filled_data:
-        print("WARNING: No fields were mapped successfully")
+    field_to_cdm = process_pdf_form(pdf_path, CDM, form_type_description)
+
+    if not field_to_cdm:
+        print("\nWARNING: No fields were mapped successfully")
         return
 
-    print(f"\nSuccessfully mapped {len(filled_data)} fields")
+    # Create fill mapping with CDM values
+    filled_data = {}
+    primary_count = 0
+    for field_name, cdm_key in field_to_cdm.items():
+        if cdm_key and cdm_key in CDM:
+            value = CDM[cdm_key]
+            if value and str(value).strip():  # Only fill non-empty values
+                filled_data[field_name] = value
+                primary_count += 1
+
+    print(f"\n{'='*80}")
+    print(f"RESULTS")
+    print(f"{'='*80}")
+    print(f"Mapped {len(field_to_cdm)} PRIMARY account holder fields")
+    print(f"Filling {len(filled_data)} fields with data")
+    secondary_skipped = len(pdf_fields) - len(field_to_cdm)
+    print(f"Skipped {secondary_skipped} secondary entity fields (beneficiary, spouse, etc.)\n")
 
     # Fill form with mapped data
     fill_acroform(pdf_path, filled_data, output_path)
@@ -110,7 +122,27 @@ if __name__ == "__main__":
     os.makedirs("filled_outputs", exist_ok=True)
 
     # Change to your test form
-    form_path = "./sample_forms/easy-acro.pdf"
-    output_path = "./filled_outputs/filled_output_easy_acroform.pdf"
+    form_path = "./sample_forms/entity-account-form.pdf"
+    output_path = "./filled_outputs/filled_output_entity-account-form.pdf"
 
-    process_form(form_path, output_path)
+    # Prompt user for form type
+    print("="*80)
+    print("PDF FORM AUTO-FILL SYSTEM")
+    print("="*80)
+    print(f"\nForm to process: {form_path}\n")
+    print("Please describe the form type and purpose.")
+    print("Examples:")
+    print("  - 'IRA Distribution Form for requesting retirement account distributions'")
+    print("  - '401(k) Rollover Form for transferring retirement funds'")
+    print("  - 'Entity Account Application for opening business investment accounts'")
+    print("  - 'Beneficiary Designation Form for naming account beneficiaries'\n")
+
+    form_type = input("Enter form type description: ").strip()
+
+    if not form_type:
+        print("\nNo form type provided. Using default...")
+        form_type = "Financial form for account holder information"
+
+    print("\n" + "="*80 + "\n")
+
+    process_form_simple(form_path, output_path, form_type)
