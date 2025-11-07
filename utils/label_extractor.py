@@ -1,11 +1,10 @@
 import fitz  # PyMuPDF
 import json
-from openai import OpenAI
-from dotenv import load_dotenv
+from utils.llm_client import get_llm_client
 import os
 
-load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Get LLM client (configured via environment variables)
+llm_client = get_llm_client()
 
 # Patterns to filter out irrelevant form fields
 IGNORE_PATTERNS = [
@@ -200,23 +199,13 @@ Return JSON for ALL {len(fields_for_prompt)} fields.
 """
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            temperature=0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a precise financial form analyzer. Return only valid JSON. Classify fields as PRIMARY or SECONDARY and map PRIMARY fields to CDM keys."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            response_format={"type": "json_object"}
-        )
+        system_prompt = "You are a precise financial form analyzer. Return only valid JSON. Classify fields as PRIMARY or SECONDARY and map PRIMARY fields to CDM keys."
 
-        result = json.loads(response.choices[0].message.content)
+        result = llm_client.generate_json(
+            system_prompt=system_prompt,
+            user_prompt=prompt,
+            temperature=0
+        )
 
         # Extract just the cdm_key mappings (remove reasoning from result)
         mappings = {}
@@ -245,6 +234,9 @@ def process_pdf_form(pdf_path, cdm_schema, form_type):
     Returns:
         Dict mapping field IDs to CDM keys: {"field_id": "cdm_key"}
     """
+    # Display LLM configuration
+    print(f"Using LLM: {llm_client.get_info()}\n")
+
     doc = fitz.open(pdf_path)
     all_mappings = {}
 
