@@ -12,7 +12,8 @@ IGNORE_PATTERNS = [
     "table", "btn", "button", "QRCode", "signature", "SignLine",
     "CLRPNT", "Header", "Footer", "Row", "Form", "Master",
     "subSection", "RB", "ck", "image", "#subform", "#pageSet",
-    "BARCOD", "Checkbox", "DateSigned", "SignHere", "FullName"
+    "BARCOD", "Checkbox", "DateSigned", "SignHere", "FullName",
+    "Check", "check", "CHK", "chk", "Radio", "radio", "Option", "option"
 ]
 
 
@@ -41,6 +42,7 @@ def filter_noise_fields(fields):
         filtered.append(field)
 
     return filtered
+
 
 
 def extract_page_fields(page):
@@ -137,10 +139,7 @@ def _process_field_chunk(page_text, fields, cdm_schema, form_type, page_num):
     cdm_categories = {
         "Personal Info": [k for k in cdm_schema.keys() if k.startswith("person.")],
         "Account Info": [k for k in cdm_schema.keys() if k.startswith("account.")],
-        "Bank Info": [k for k in cdm_schema.keys() if k.startswith("bank.")],
-        "Plan Info": [k for k in cdm_schema.keys() if k.startswith("plan.")],
-        "Distribution Info": [k for k in cdm_schema.keys() if k.startswith("distribution.")],
-        "Tax Info": [k for k in cdm_schema.keys() if k.startswith("tax.")]
+        "Bank Info": [k for k in cdm_schema.keys() if k.startswith("bank.")]
     }
 
     cdm_text = "\n".join([
@@ -157,7 +156,7 @@ def _process_field_chunk(page_text, fields, cdm_schema, form_type, page_num):
     prompt = f"""FORM TYPE: {form_type}
 
 PAGE {page_num} TEXT:
-{page_text[:3000]}...
+{page_text}
 
 FIELDS TO CLASSIFY (Y-ordered):
 {json.dumps(fields_for_prompt, indent=2)}
@@ -165,18 +164,31 @@ FIELDS TO CLASSIFY (Y-ordered):
 CDM KEYS: {cdm_text}
 
 TASK: For each field, determine:
-1. ENTITY: Is this PRIMARY account holder or SECONDARY (beneficiary/spouse/auth/trustee)?
-   - Check page text for section context
-   - Check field ID for hints ("benef", "spouse", "auth" = SECONDARY)
-   - Check Y-position: fields grouped together = same entity
-   - If uncertain → SECONDARY (safe)
+1. PAGE ANALYSIS: Understand the purpose of the page section-wise:
+   - PRIMARY = The person/entity submitting this form (YOUR account, YOUR information, the account holder)
+   - SECONDARY = Third parties NOT submitting the form (beneficiaries, spouse, authorized users, receiving institutions, delivering firms)
+   - **CRITICAL for transfer/rollover forms**: "YOUR [institution] account" is ALWAYS PRIMARY, even if it's the receiving/destination account in the transfer
+     * Transfer direction (FROM institution A TO institution B) does NOT determine PRIMARY vs SECONDARY
+     * Only check: Does the section header say "YOUR account", "your information", "account holder"? → PRIMARY
+     * Example: "Tell Us About YOUR Schwab Account" = PRIMARY (even though Schwab is receiving the transfer)
+   - Identify sections with multiple choice options (e.g., "Choose A, B, C, or D") → ALL fields in such sections are SECONDARY
+   - Identify the boundaries of each section using headers and Y-positions
 
-2. CDM MAPPING (PRIMARY only):
+2. FIELD CLASSIFICATION: For each field, classify as PRIMARY or SECONDARY:
+   - Is field in a choice-based section? → SECONDARY (requires user decision first)
+   - Check page text for section context (which section is this field in?)
+   - Check field ID for hints ("benef", "spouse", "auth", "trustee" = SECONDARY)
+   - Check Y-position: fields grouped together usually belong to same entity
+   - If uncertain → SECONDARY (safe default)
+
+3. CDM MAPPING (PRIMARY fields only):
+   - FullName/Name (combined) → person.full_name
    - FirstName/Given → person.first_name
    - LastName/Surname → person.last_name
    - SSN/TaxID → person.ssn
    - Phone/Tel → person.phone
-   - Address/Street → person.address
+   - Address (full) → person.address
+   - Street (only) → person.street
    - City → person.city, State → person.state, ZIP → person.zip
    - AccountNum/AcctNum → account.number
    - AccountType → account.type
@@ -184,15 +196,24 @@ TASK: For each field, determine:
    - If SECONDARY or no match → null
 
 RULES:
-- Beneficiary/Spouse/Authorized sections → SECONDARY
-- Field ID with "benef"/"spouse"/"auth"/"trustee" → SECONDARY
-- When uncertain → SECONDARY
+- CRITICAL: Avoid all fields in sections with multiple choice options (e.g., "Choose A, B, C, or D", "Select one of the following")
+  These sections require user selection before filling → mark ALL fields in such sections as SECONDARY
+- **Transfer forms special rule**: Section headers with "YOUR account", "your information", "account holder" = PRIMARY (ignore transfer direction)
+  * Don't overthink which account is source vs destination in transfer/rollover forms
+  * Focus ONLY on possessive keywords indicating the form submitter's identity
+- PRIMARY = Person/entity SUBMITTING the form (keywords: "your", "account holder", "applicant", "owner")
+- SECONDARY = All other parties (keywords: "beneficiary", "spouse", "authorized user", "receiving firm", "delivering institution", "trustee")
+- Don't fill checkbox/radio button fields themselves
+- Don't make assumptions - base decisions strictly on page text and field ID
+- Field IDs containing "benef"/"spouse"/"auth"/"trustee"/"deliver"/"receiv" → SECONDARY
+- When uncertain → SECONDARY (safe default)
 
 OUTPUT (valid JSON only):
 {{
   "FirstName[0]": {{"cdm_key": "person.first_name", "reasoning": "Primary holder section, Y:150, FirstName → person.first_name"}},
   "benef_FirstName[0]": {{"cdm_key": null, "reasoning": "Beneficiary section, has 'benef' prefix → SECONDARY"}},
-  "AcctNum[0]": {{"cdm_key": "account.number", "reasoning": "Primary section, AccountNum → account.number"}}
+  "AcctNum[0]": {{"cdm_key": "account.number", "reasoning": "Primary section, AccountNum → account.number"}},
+  "MailAddress[0]": {{"cdm_key": null, "reasoning": "Inside choice section 'Choose A, B, or C' → SECONDARY (requires user selection)"}}
 }}
 
 Return JSON for ALL {len(fields_for_prompt)} fields.
@@ -207,13 +228,34 @@ Return JSON for ALL {len(fields_for_prompt)} fields.
             temperature=0
         )
 
+        # Display model reasoning for debugging
+        print(f"\n  🧠 Model Reasoning:")
+        for field_id, data in result.items():
+            if isinstance(data, dict) and "reasoning" in data:
+                cdm = data.get("cdm_key", "null")
+                reasoning = data.get("reasoning", "")
+                # Show mappings with reasoning
+                if cdm:
+                    print(f"    ✓ {field_id} → {cdm}")
+                    print(f"      💭 {reasoning}")
+                else:
+                    print(f"    ✗ {field_id} → SECONDARY")
+                    print(f"      💭 {reasoning}")
+        print()  # blank line after reasoning section
+
         # Extract just the cdm_key mappings (remove reasoning from result)
+        # Only include fields with valid (non-null, non-empty) CDM mappings
         mappings = {}
         for field_id, data in result.items():
             if isinstance(data, dict):
-                mappings[field_id] = data.get("cdm_key")
+                cdm_key = data.get("cdm_key")
+                # Only store if cdm_key is not None, not empty string, and not "null" string
+                if cdm_key and cdm_key != "null":
+                    mappings[field_id] = cdm_key
             else:
-                mappings[field_id] = data
+                # Handle case where LLM returns just a string value
+                if data and data != "null":
+                    mappings[field_id] = data
 
         return mappings
 
@@ -265,15 +307,17 @@ def process_pdf_form(pdf_path, cdm_schema, form_type):
             page_num + 1
         )
 
-        # Store both short and full field names
+        # Store ONLY full field names to prevent collisions between sections
+        # (e.g., PRIMARY "streetname[0]" vs SECONDARY "streetname[0]" in different sections)
         for field in filtered_fields:
             short_id = field["field_id"]
             full_id = field["full_field_id"]
 
             if short_id in mappings:
                 cdm_key = mappings[short_id]
-                if cdm_key:  # Only store if not null
-                    all_mappings[short_id] = cdm_key
+                # Double-check: only store non-null, non-empty CDM keys
+                if cdm_key and isinstance(cdm_key, str) and cdm_key.strip():
+                    # Only store full field name (not short name) to prevent collisions
                     all_mappings[full_id] = cdm_key
 
     doc.close()

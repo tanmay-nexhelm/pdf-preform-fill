@@ -1,131 +1,156 @@
+"""
+PDF Form Auto-Fill System using Claude Sonnet 4.5
+
+This module provides functionality to automatically fill PDF forms using LLM-based
+field classification and mapping to a Canonical Data Model (CDM).
+"""
+
 import os
 from utils.fill_utils import fill_acroform
 from utils.label_extractor import process_pdf_form
 from PyPDF2 import PdfReader
 
-# ----------------------------
-#  Canonical Data Model (CDM)
-# ----------------------------
-CDM = {
-    # Personal Information
-    "person.first_name": "Jane",
-    "person.middle_name": "Marie",
-    "person.last_name": "Doe",
-    "person.suffix": "Jr.",
-    "person.ssn": "123-45-6789",
-    "person.phone": "767-788-3272",
-    "person.phone_extension": "123",
-    "person.address": "123 Main Street, New York, NY",
-    "person.city": "New York",
-    "person.state": "NY",
-    "person.zip": "10001",
 
-    # Account Information
-    "account.number": "SCHW12345",
-    "account.type": "Individual",
-    "bank.name": "Chase Bank",
-
-    # Employer/Plan Information
-    "plan.employer_name": "ABC Corporation",
-    "plan.type": "401(k)",
-    "plan.name": "ABC Corp 401(k) Plan",
-
-    # Distribution Information
-    "distribution.type": "One-Time",
-    "distribution.onetime_cash_amount": "50000.00",
-    "distribution.onetime_securities": "No",
-    "distribution.recurring_cash_amount": "",
-    "distribution.recurring_start_date": "",
-    "distribution.recurring_frequency": "",
-    "distribution.recurring_income_option": "",
-    "distribution.recurring_income_start_date": "",
-    "distribution.lump_sum": "Yes",
-
-    # Tax Withholding
-    "tax.federal_withholding_rate": "20",
-    "tax.state_withholding": "NY",
-    "tax.state_withholding_rate": "5"
-}
-
-
-# ----------------------------
-#  Utility Functions
-# ----------------------------
-
-def detect_form_type(pdf_path):
-    """Detect whether the PDF is an AcroForm or static."""
-    reader = PdfReader(pdf_path)  # using PyPDF2 to read the PDF file
-    if "/AcroForm" in reader.trailer["/Root"]:
-        return "acroform"
-    return "static"
-
-
-def process_form_simple(pdf_path, output_path, form_type_description):
+def get_default_cdm():
     """
-    Process PDF form with simplified workflow - single LLM call per page.
+    Get default Canonical Data Model (CDM) with sample data.
+
+    Returns:
+        dict: CDM with personal and account information
+    """
+    return {
+        # Personal Information
+        "person.full_name": "Jane Marie Doe",
+        "person.first_name": "Jane",
+        "person.middle_name": "Marie",
+        "person.last_name": "Doe",
+        "person.suffix": "Jr.",
+        "person.ssn": "123-45-6789",
+        "person.phone": "767-788-3272",
+        "person.phone_extension": "123",
+        "person.address": "123 Main Street, New York, NY",
+        "person.street": "123 Main Street",
+        "person.city": "New York",
+        "person.state": "NY",
+        "person.zip": "10001",
+
+        # Account Information
+        "account.number": "SCHW12345",
+        "account.type": "Individual",
+        "bank.name": "Chase Bank"
+    }
+
+
+def process_pdf_form_with_cdm(pdf_path, output_path, form_type_description, cdm_data=None, verbose=True):
+    """
+    Process and fill a PDF form using LLM-based field classification.
+
+    This function:
+    1. Extracts form fields from the PDF
+    2. Uses LLM to classify fields as PRIMARY (account holder) or SECONDARY (third parties)
+    3. Maps PRIMARY fields to CDM keys
+    4. Fills the form with CDM data
+    5. Saves the filled PDF
 
     Args:
-        pdf_path: Path to input PDF form
-        output_path: Path for output filled PDF
-        form_type_description: Description of the form type and purpose
+        pdf_path (str): Path to input PDF form
+        output_path (str): Path for output filled PDF
+        form_type_description (str): Description of the form type and purpose
+                                     (e.g., "IRA Distribution Request Form")
+        cdm_data (dict, optional): Canonical Data Model with user data.
+                                   Uses default sample data if None.
+        verbose (bool, optional): Print detailed progress. Defaults to True.
+
+    Returns:
+        dict: Results containing field counts and processing info, or None if error
     """
-    print(f"Processing form: {pdf_path}")
-    print(f"Form Type: {form_type_description}\n")
+    cdm = cdm_data or get_default_cdm()
 
-    # Get actual PDF field names to verify form has fields
-    reader = PdfReader(pdf_path)
-    pdf_fields = reader.get_fields()
+    if verbose:
+        print(f"Processing form: {pdf_path}")
+        print(f"Form Type: {form_type_description}\n")
+
+    # Verify form has fields
+    try:
+        reader = PdfReader(pdf_path)
+        pdf_fields = reader.get_fields()
+    except Exception as e:
+        if verbose:
+            print(f"ERROR: Failed to read PDF: {e}")
+        return None
+
     if not pdf_fields:
-        print("ERROR: No form fields found in PDF")
-        return
+        if verbose:
+            print("ERROR: No form fields found in PDF")
+        return None
 
-    print(f"Found {len(pdf_fields)} total fields in PDF\n")
+    if verbose:
+        print(f"Found {len(pdf_fields)} total fields in PDF\n")
+        print("="*80)
+        print("PROCESSING WITH CLAUDE SONNET 4.5")
+        print("="*80 + "\n")
 
-    # Process PDF with simplified workflow: extract fields + classify + map in one go
-    print("="*80)
-    print("PROCESSING PAGES WITH CHAIN-OF-THOUGHT REASONING")
-    print("="*80 + "\n")
-
-    field_to_cdm = process_pdf_form(pdf_path, CDM, form_type_description)
+    # Process PDF: classify fields and map to CDM
+    try:
+        field_to_cdm = process_pdf_form(pdf_path, cdm, form_type_description)
+    except Exception as e:
+        if verbose:
+            print(f"ERROR: Failed to process form: {e}")
+        return None
 
     if not field_to_cdm:
-        print("\nWARNING: No fields were mapped successfully")
-        return
+        if verbose:
+            print("\nWARNING: No fields were mapped successfully")
+        return None
 
     # Create fill mapping with CDM values
     filled_data = {}
-    primary_count = 0
     for field_name, cdm_key in field_to_cdm.items():
-        if cdm_key and cdm_key in CDM:
-            value = CDM[cdm_key]
-            if value and str(value).strip():  # Only fill non-empty values
+        if cdm_key and cdm_key in cdm:
+            value = cdm[cdm_key]
+            if value and str(value).strip():
                 filled_data[field_name] = value
-                primary_count += 1
 
-    print(f"\n{'='*80}")
-    print(f"RESULTS")
-    print(f"{'='*80}")
-    print(f"Mapped {len(field_to_cdm)} PRIMARY account holder fields")
-    print(f"Filling {len(filled_data)} fields with data")
-    secondary_skipped = len(pdf_fields) - len(field_to_cdm)
-    print(f"Skipped {secondary_skipped} secondary entity fields (beneficiary, spouse, etc.)\n")
+    # Print results
+    if verbose:
+        print(f"\n{'='*80}")
+        print("RESULTS")
+        print(f"{'='*80}")
+        print(f"Mapped {len(field_to_cdm)} PRIMARY account holder fields")
+        print(f"Filling {len(filled_data)} fields with data")
+        secondary_skipped = len(pdf_fields) - len(field_to_cdm)
+        print(f"Skipped {secondary_skipped} secondary entity fields (beneficiary, spouse, etc.)\n")
 
-    # Fill form with mapped data
-    fill_acroform(pdf_path, filled_data, output_path)
+    # Fill and save form
+    try:
+        fill_acroform(pdf_path, filled_data, output_path)
+        if verbose:
+            print(f"Complete: {output_path}")
+    except Exception as e:
+        if verbose:
+            print(f"ERROR: Failed to fill form: {e}")
+        return None
 
-    print(f"Complete: {output_path}")
+    return {
+        "total_fields": len(pdf_fields),
+        "primary_mapped": len(field_to_cdm),
+        "fields_filled": len(filled_data),
+        "secondary_skipped": len(pdf_fields) - len(field_to_cdm),
+        "output_path": output_path
+    }
 
-# ----------------------------
-#  Entry Point
-# ----------------------------
-if __name__ == "__main__":
+
+def main():
+    """
+    Interactive command-line interface for PDF form filling.
+    """
     os.makedirs("filled_outputs", exist_ok=True)
 
-    # Change to your test form
+    # Default form path (can be changed)
     form_path = "./sample_forms/entity-account-form.pdf"
-    output_path = "./filled_outputs/filled_output_entity-account-form.pdf"
+    output_path = "./filled_outputs/filled_output.pdf"
 
-    # Prompt user for form type
+    # Display interface
     print("="*80)
     print("PDF FORM AUTO-FILL SYSTEM")
     print("="*80)
@@ -135,7 +160,7 @@ if __name__ == "__main__":
     print("  - 'IRA Distribution Form for requesting retirement account distributions'")
     print("  - '401(k) Rollover Form for transferring retirement funds'")
     print("  - 'Entity Account Application for opening business investment accounts'")
-    print("  - 'Beneficiary Designation Form for naming account beneficiaries'\n")
+    print("  - 'Wire Transfer Request Form for sending funds'\n")
 
     form_type = input("Enter form type description: ").strip()
 
@@ -145,4 +170,9 @@ if __name__ == "__main__":
 
     print("\n" + "="*80 + "\n")
 
-    process_form_simple(form_path, output_path, form_type)
+    # Process form
+    process_pdf_form_with_cdm(form_path, output_path, form_type)
+
+
+if __name__ == "__main__":
+    main()

@@ -20,15 +20,10 @@ def fill_acroform(pdf_path, filled_data, output_path):
     for page in doc:
         for field in page.widgets():
             full_field_name = field.field_name
-            # Extract short name (last part after last dot)
-            # e.g., 'clients[0].Form[0].SchwabAccountNumbe[0]' -> 'SchwabAccountNumbe[0]'
-            short_field_name = full_field_name.split('.')[-1] if '.' in full_field_name else full_field_name
 
-            # Check both full and short names
+            # Only use full field name to prevent collisions between PRIMARY and SECONDARY fields
             if full_field_name in filled_data:
                 value = str(filled_data[full_field_name])
-            elif short_field_name in filled_data:
-                value = str(filled_data[short_field_name])
             else:
                 continue
 
@@ -37,7 +32,9 @@ def fill_acroform(pdf_path, filled_data, output_path):
                 field.update()
                 filled_count += 1
             except Exception as e:
-                print(f"WARNING: Failed to fill {short_field_name}: {e}")
+                # Extract short name for error message only
+                short_name = full_field_name.split('.')[-1] if '.' in full_field_name else full_field_name
+                print(f"WARNING: Failed to fill {short_name}: {e}")
 
     print(f"Filled {filled_count} fields")
 
