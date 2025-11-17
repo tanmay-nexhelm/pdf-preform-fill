@@ -82,7 +82,7 @@ def extract_page_fields(page):
     return fields
 
 
-def classify_and_map_fields_llm(page_text, fields, cdm_schema, form_type, page_num, chunk_size=25):
+def classify_and_map_fields_llm(page_text, fields, cdm_schema, form_type, page_num, chunk_size=50):
     """
     Process fields in chunks using GPT-4o-mini for fast classification and mapping.
 
@@ -92,7 +92,7 @@ def classify_and_map_fields_llm(page_text, fields, cdm_schema, form_type, page_n
         cdm_schema: Dict of CDM keys and their values
         form_type: Description of form type provided by user
         page_num: Page number (for context)
-        chunk_size: Number of fields to process per LLM call (default: 25)
+        chunk_size: Number of fields to process per LLM call (default: 50)
 
     Returns:
         Dict mapping field IDs to CDM keys: {"field_id": "cdm_key" or None}
@@ -118,6 +118,40 @@ def classify_and_map_fields_llm(page_text, fields, cdm_schema, form_type, page_n
     return all_mappings
 
 
+def _generate_dynamic_examples(cdm_schema):
+    """
+    Generate dynamic examples from actual CDM keys for the prompt.
+
+    Args:
+        cdm_schema: Dict of CDM keys and their values
+
+    Returns:
+        String with JSON examples adapted to the CDM schema
+    """
+    # Get sample CDM keys for examples
+    sample_keys = list(cdm_schema.keys())[:3] if cdm_schema else []
+
+    if not sample_keys:
+        # Fallback generic examples
+        return """{{
+  "Field1[0]": {{"cdm_key": "cdm.key.example", "reasoning": "Primary submitter section, field matches CDM key purpose"}},
+  "OtherPartyField[0]": {{"cdm_key": null, "reasoning": "Third party section → SECONDARY"}},
+  "ChoiceField[0]": {{"cdm_key": null, "reasoning": "Inside choice section requiring user selection → SECONDARY"}}
+}}"""
+
+    # Generate examples using actual CDM keys
+    example_primary = sample_keys[0]
+    example_key_name = example_primary.split('.')[-1] if '.' in example_primary else example_primary
+
+    examples = f"""{{
+  "{example_key_name.title()}[0]": {{"cdm_key": "{example_primary}", "reasoning": "Primary submitter section at Y:150, field purpose matches '{example_primary}'"}},
+  "ThirdParty_{example_key_name.title()}[0]": {{"cdm_key": null, "reasoning": "Third party section, not the form submitter → SECONDARY"}},
+  "ChoiceOption[0]": {{"cdm_key": null, "reasoning": "Inside multi-choice section requiring user decision → SECONDARY"}}
+}}"""
+
+    return examples
+
+
 def _process_field_chunk(page_text, fields, cdm_schema, form_type, page_num):
     """
     Process a chunk of fields with simplified chain-of-thought reasoning.
@@ -135,12 +169,18 @@ def _process_field_chunk(page_text, fields, cdm_schema, form_type, page_num):
     if not fields:
         return {}
 
-    # Organize CDM keys by category
-    cdm_categories = {
-        "Personal Info": [k for k in cdm_schema.keys() if k.startswith("person.")],
-        "Account Info": [k for k in cdm_schema.keys() if k.startswith("account.")],
-        "Bank Info": [k for k in cdm_schema.keys() if k.startswith("bank.")]
-    }
+    # Organize CDM keys by category for better presentation
+    cdm_categories = {}
+    for key in cdm_schema.keys():
+        if '.' in key:
+            category = key.split('.')[0].title()
+            if category not in cdm_categories:
+                cdm_categories[category] = []
+            cdm_categories[category].append(key)
+        else:
+            if "Other" not in cdm_categories:
+                cdm_categories["Other"] = []
+            cdm_categories["Other"].append(key)
 
     cdm_text = "\n".join([
         f"{cat}: {', '.join(keys)}"
@@ -153,6 +193,9 @@ def _process_field_chunk(page_text, fields, cdm_schema, form_type, page_num):
         for f in fields
     ]
 
+    # Generate dynamic examples from CDM schema
+    dynamic_examples = _generate_dynamic_examples(cdm_schema)
+
     prompt = f"""FORM TYPE: {form_type}
 
 PAGE {page_num} TEXT:
@@ -164,63 +207,58 @@ FIELDS TO CLASSIFY (Y-ordered):
 CDM KEYS: {cdm_text}
 
 TASK: For each field, determine:
-1. PAGE ANALYSIS: Understand the purpose of the page section-wise:
-   - PRIMARY = The person/entity submitting this form (YOUR account, YOUR information, the account holder)
-   - SECONDARY = Third parties NOT submitting the form (beneficiaries, spouse, authorized users, receiving institutions, delivering firms)
-   - **CRITICAL for transfer/rollover forms**: "YOUR [institution] account" is ALWAYS PRIMARY, even if it's the receiving/destination account in the transfer
-     * Transfer direction (FROM institution A TO institution B) does NOT determine PRIMARY vs SECONDARY
-     * Only check: Does the section header say "YOUR account", "your information", "account holder"? → PRIMARY
-     * Example: "Tell Us About YOUR Schwab Account" = PRIMARY (even though Schwab is receiving the transfer)
-   - Identify sections with multiple choice options (e.g., "Choose A, B, C, or D") → ALL fields in such sections are SECONDARY
-   - Identify the boundaries of each section using headers and Y-positions
 
-2. FIELD CLASSIFICATION: For each field, classify as PRIMARY or SECONDARY:
-   - Is field in a choice-based section? → SECONDARY (requires user decision first)
-   - Check page text for section context (which section is this field in?)
-   - Check field ID for hints ("benef", "spouse", "auth", "trustee" = SECONDARY)
-   - Check Y-position: fields grouped together usually belong to same entity
-   - If uncertain → SECONDARY (safe default)
+1. SECTION ANALYSIS - Identify who owns each section:
+   Use these OWNERSHIP INDICATORS to classify sections:
+
+   PRIMARY INDICATORS (form submitter/signer):
+   - Possessive pronouns: "your", "my", "I", "me"
+   - Identity terms: "applicant", "account holder", "owner", "primary", "participant"
+   - Section headers like: "Your Information", "About You", "Account Holder Details"
+
+   SECONDARY INDICATORS (other parties):
+   - Other person references: "beneficiary", "spouse", "dependent", "joint owner", "authorized user"
+   - Other institution references: "receiving firm", "delivering institution", "transfer agent"
+   - Directional terms suggesting recipient: "to be sent to", "payable to", "recipient"
+
+   CRITICAL PRINCIPLE: Focus on WHO the section describes, NOT the transaction flow
+   - Section about "YOUR account" = PRIMARY (even if it's receiving/destination in a transfer)
+   - Section about "Beneficiary" = SECONDARY (even if they're getting distributions)
+   - Section about "Spouse" = SECONDARY (even if joint owner)
+
+2. FIELD CLASSIFICATION LOGIC:
+
+   Step 1: Determine section ownership using indicators above
+   Step 2: Check for special cases:
+   - Multi-choice sections ("Choose A, B, or C") → ALL fields SECONDARY (requires user decision)
+   - Checkbox/radio fields themselves → SECONDARY (not data fields)
+
+   Step 3: Classify field:
+   - In PRIMARY section + not special case → PRIMARY
+   - In SECONDARY section OR special case → SECONDARY
+   - Uncertain → SECONDARY (safe default)
 
 3. CDM MAPPING (PRIMARY fields only):
-   - FullName/Name (combined) → person.full_name
-   - FirstName/Given → person.first_name
-   - LastName/Surname → person.last_name
-   - SSN/TaxID → person.ssn
-   - Phone/Tel → person.phone
-   - Address (full) → person.address
-   - Street (only) → person.street
-   - City → person.city, State → person.state, ZIP → person.zip
-   - AccountNum/AcctNum → account.number
-   - AccountType → account.type
-   - BankName → bank.name
-   - If SECONDARY or no match → null
+   - Match field semantic purpose to available CDM keys
+   - Use field ID, section context, and position as hints
+   - Refer to examples below for mapping patterns
+   - If no clear CDM match → null
 
-RULES:
-- CRITICAL: Avoid all fields in sections with multiple choice options (e.g., "Choose A, B, C, or D", "Select one of the following")
-  These sections require user selection before filling → mark ALL fields in such sections as SECONDARY
-- **Transfer forms special rule**: Section headers with "YOUR account", "your information", "account holder" = PRIMARY (ignore transfer direction)
-  * Don't overthink which account is source vs destination in transfer/rollover forms
-  * Focus ONLY on possessive keywords indicating the form submitter's identity
-- PRIMARY = Person/entity SUBMITTING the form (keywords: "your", "account holder", "applicant", "owner")
-- SECONDARY = All other parties (keywords: "beneficiary", "spouse", "authorized user", "receiving firm", "delivering institution", "trustee")
-- Don't fill checkbox/radio button fields themselves
-- Don't make assumptions - base decisions strictly on page text and field ID
-- Field IDs containing "benef"/"spouse"/"auth"/"trustee"/"deliver"/"receiv" → SECONDARY
-- When uncertain → SECONDARY (safe default)
+CORE PRINCIPLES:
+1. Possessive language determines ownership ("your X" = PRIMARY)
+2. Multi-choice sections always require user selection → SECONDARY
+3. Focus on section headers and grouping, not individual field IDs
+4. When in doubt about classification → SECONDARY
+5. When in doubt about CDM mapping → null
 
 OUTPUT (valid JSON only):
-{{
-  "FirstName[0]": {{"cdm_key": "person.first_name", "reasoning": "Primary holder section, Y:150, FirstName → person.first_name"}},
-  "benef_FirstName[0]": {{"cdm_key": null, "reasoning": "Beneficiary section, has 'benef' prefix → SECONDARY"}},
-  "AcctNum[0]": {{"cdm_key": "account.number", "reasoning": "Primary section, AccountNum → account.number"}},
-  "MailAddress[0]": {{"cdm_key": null, "reasoning": "Inside choice section 'Choose A, B, or C' → SECONDARY (requires user selection)"}}
-}}
+{dynamic_examples}
 
 Return JSON for ALL {len(fields_for_prompt)} fields.
 """
 
     try:
-        system_prompt = "You are a precise financial form analyzer. Return only valid JSON. Classify fields as PRIMARY or SECONDARY and map PRIMARY fields to CDM keys."
+        system_prompt = "You are a precise form analyzer. Return only valid JSON. Classify fields as PRIMARY (form submitter) or SECONDARY (other parties) and map PRIMARY fields to available CDM keys."
 
         result = llm_client.generate_json(
             system_prompt=system_prompt,
