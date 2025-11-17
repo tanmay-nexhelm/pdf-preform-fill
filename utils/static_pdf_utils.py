@@ -247,23 +247,8 @@ def fill_pdf_with_values(
         baseline_y = y1 + baseline_offset
         text_position = fitz.Point(x0, baseline_y)
 
-        # Debug mode: visualize
+        # Debug mode: console logging only (visual boxes removed)
         if debug_mode:
-            shape = page.new_shape()
-            # Draw original bounding box in red
-            shape.draw_rect(original_rect)
-            shape.finish(color=(1, 0, 0), width=0.5)
-            # Draw baseline as blue horizontal line
-            shape.draw_line(
-                fitz.Point(x0, baseline_y),
-                fitz.Point(x1, baseline_y)
-            )
-            shape.finish(color=(0, 0, 1), width=0.8)
-            # Draw text start point as green dot
-            shape.draw_circle(text_position, 1.5)
-            shape.finish(color=(0, 1, 0), fill=(0, 1, 0))
-            shape.commit()
-
             print(f"🔍 DEBUG: '{key}' -> '{value}'")
             print(f"   Page: {page_index + 1}")
             print(f"   Bounding box: {original_rect} (height: {original_rect.height:.2f}pts)")
